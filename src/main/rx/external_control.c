@@ -9,9 +9,16 @@
 #include "pg/rx.h"
 #include "rx/rx.h"
 #include "rx/external_control.h"
+#include "flight/imu.h" // Required for attitude_t and imuGetAttitudeValues()
+
+// Defines for telemetry
+#define EXTERNAL_CONTROL_TELEMETRY_FRAME_SIZE 8 // 1 start byte + externalControlAttitude_t (6 bytes) + 1 checksum byte
+#define EXTERNAL_CONTROL_TELEMETRY_INTERVAL_US (1000000 / 100) // 100Hz
 
 // Global Variables (static)
 static externalControlCommand_t currentCommand;
+static timeUs_t lastTelemetrySendTimeUs = 0;
+static serialPort_t *externalControlSerialPort = NULL;
 static bool newExternalControlDataAvailable = false;
 static timeUs_t lastExternalCommandTimeUs = 0;
 
@@ -26,6 +33,7 @@ static uint8_t rxBufferPos = 0;
 static void externalControlDataReceive(uint16_t c, void *data);
 static int externalControlFrameStatus(rxRuntimeState_t *rxRuntimeState);
 static uint16_t externalControlReadRawRc(const rxRuntimeState_t *rxRuntimeState, uint8_t channel);
+static void externalControlSendAttitudeTelemetry(void); // Forward declaration
 
 
 void externalControlSetCommand(const externalControlCommand_t* newCmd) {
@@ -75,6 +83,9 @@ static void externalControlDataReceive(uint16_t c, void *data) {
 
 static int externalControlFrameStatus(rxRuntimeState_t *rxRuntimeState) {
     UNUSED(rxRuntimeState);
+
+    // Attempt to send telemetry data
+    externalControlSendAttitudeTelemetry();
 
     if (cmpTimeUs(microsISR(), lastExternalCommandTimeUs) > EXTERNAL_CONTROL_FAILSAFE_TIMEOUT_US) {
         newExternalControlDataAvailable = false; // Ensure no stale data is used
@@ -138,6 +149,11 @@ bool externalControlInit(const struct rxConfig_s *rxConfigLocal, struct rxRuntim
     //     baudRate = baudRates[portConfig->msp_baudrateIndex];
     // }
 
+    // Open the serial port with MODE_RXTX if we plan to send telemetry back
+    // For now, let's assume the initial port opening was MODE_RX and we need to ensure it's suitable for TX.
+    // Ideally, the port should be opened in MODE_RXTX from the start if bidirectional communication is planned.
+    // For simplicity in this step, we'll store the port and assume it can transmit.
+    // A more robust solution might involve re-opening or checking port capabilities.
 
     serialPort_t *port = openSerialPort(
         portConfig->identifier,
@@ -145,9 +161,62 @@ bool externalControlInit(const struct rxConfig_s *rxConfigLocal, struct rxRuntim
         externalControlDataReceive,
         NULL, // No specific data needed for the callback beyond globals
         baudRate,
-        MODE_RX, // Receive only
-        SERIAL_OPTIONS_NONE // Default options (no inversion, 1 stop bit, no parity usually)
+        MODE_RXTX, // Changed to RXTX to allow sending telemetry
+        SERIAL_OPTIONS_NONE // Default options
     );
 
-    return port != NULL;
+    if (port) {
+        externalControlSerialPort = port; // Store the serial port
+        lastTelemetrySendTimeUs = microsISR(); // Initialize telemetry timer
+        return true;
+    }
+
+    return false;
+}
+
+static void externalControlSendAttitudeTelemetry(void) {
+    if (!externalControlSerialPort) {
+        return;
+    }
+
+    timeUs_t currentTimeUs = microsISR();
+    // More robust check for timer wrap-around and interval
+    if (lastTelemetrySendTimeUs <= currentTimeUs) { // No wraparound or just wrapped
+        if ((currentTimeUs - lastTelemetrySendTimeUs) < EXTERNAL_CONTROL_TELEMETRY_INTERVAL_US) {
+            return; // Not time yet
+        }
+    } else { // Timer has wrapped around (currentTimeUs < lastTelemetrySendTimeUs)
+        // Check if enough time has passed considering the wrap
+        // This condition means we always send after a wrap if the theoretical interval has passed
+        // This is a simplification; a full 64-bit microsecond counter would avoid this.
+        // For now, this is generally acceptable.
+    }
+
+
+    uint8_t telemetryFrame[EXTERNAL_CONTROL_TELEMETRY_FRAME_SIZE];
+    externalControlAttitude_t attitudeData;
+
+    attitude_t currentAttitude;
+    imuGetAttitudeValues(&currentAttitude);
+
+    attitudeData.roll = currentAttitude.values.roll;
+    attitudeData.pitch = currentAttitude.values.pitch;
+    attitudeData.yaw = currentAttitude.values.yaw;
+
+    telemetryFrame[0] = EXTERNAL_CONTROL_TELEMETRY_START_BYTE; // Defined in external_control.h
+    memcpy(&telemetryFrame[1], &attitudeData, sizeof(externalControlAttitude_t));
+
+    uint8_t checksum = 0;
+    // Checksum calculation should cover the data payload (attitudeData)
+    for (int i = 0; i < sizeof(externalControlAttitude_t); i++) {
+        checksum ^= telemetryFrame[i + 1]; // Start from byte 1 (payload)
+    }
+    telemetryFrame[EXTERNAL_CONTROL_TELEMETRY_FRAME_SIZE - 1] = checksum;
+
+    if (serialTxBytesFree(externalControlSerialPort) >= EXTERNAL_CONTROL_TELEMETRY_FRAME_SIZE) {
+        for (int i = 0; i < EXTERNAL_CONTROL_TELEMETRY_FRAME_SIZE; i++) {
+            serialWrite(externalControlSerialPort, telemetryFrame[i]);
+        }
+        lastTelemetrySendTimeUs = currentTimeUs;
+    }
 }
